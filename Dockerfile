@@ -8,10 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir uv
 
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+# Install dependencies first (without the local project) for better caching.
+COPY pyproject.toml uv.lock README.md ./
+RUN uv sync --frozen --no-dev --no-install-project
 
+# Now copy source and install the project itself.
 COPY app ./app
+RUN uv sync --frozen --no-dev
 
 ENV EXAM_DB_PATH=/data/exam.db
 ENV EXAM_UPLOAD_DIR=/data/uploads
