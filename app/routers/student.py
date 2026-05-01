@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
 from .. import models, schemas
@@ -116,17 +117,41 @@ def start_attempt(body: schemas.StartAttemptRequest, db: Session = Depends(get_d
     c = db.query(models.ExamCode).filter(models.ExamCode.code == code).first()
     if not c:
         raise HTTPException(404, "Mã thi không tồn tại")
-    if c.used_at is not None:
-        raise HTTPException(
-            403,
-            f"Mã thi này đã được dùng bởi {c.used_by}. Mỗi mã chỉ sử dụng một lần.",
-        )
     exam = c.exam
     if not exam.is_active:
         raise HTTPException(403, "Đề thi hiện đang bị khoá")
-    # Mark code used and create attempt
-    c.used_by = body.student_name.strip()
-    c.used_at = datetime.utcnow()
+    # Atomically reserve a slot. The WHERE clause guarantees only one of N
+    # concurrent requests succeeds when uses_count == max_uses - 1, so the
+    # cap can never be exceeded even with parallel students.
+    now = datetime.utcnow()
+    student_name = body.student_name.strip()
+    result = db.execute(
+        update(models.ExamCode)
+        .where(
+            models.ExamCode.id == c.id,
+            or_(
+                models.ExamCode.max_uses == 0,
+                models.ExamCode.uses_count < models.ExamCode.max_uses,
+            ),
+        )
+        .values(
+            uses_count=models.ExamCode.uses_count + 1,
+            used_by=student_name,
+            used_at=now,
+        )
+    )
+    if result.rowcount == 0:
+        # Cap reached between fetch and update — re-read for accurate error.
+        db.commit()
+        fresh = db.query(models.ExamCode).filter(models.ExamCode.id == c.id).first()
+        if fresh and fresh.max_uses == 1:
+            msg = f"Mã thi này đã được dùng bởi {fresh.used_by}. Mỗi mã chỉ sử dụng một lần."
+        elif fresh:
+            msg = f"Mã thi này đã đạt giới hạn sử dụng ({fresh.uses_count}/{fresh.max_uses})."
+        else:
+            msg = "Mã thi không tồn tại"
+        raise HTTPException(403, msg)
+    db.refresh(c)
     order_ids = _compute_question_order(exam)
     attempt = models.Attempt(
         exam_id=exam.id,
