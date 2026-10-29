@@ -46,8 +46,22 @@ App đang chạy tại: https://exam-online-backend-fxiwahty.fly.dev/
 
 | `type` | Mô tả | Đáp án |
 |---|---|---|
-| `mc` | Trắc nghiệm A/B/C/D, chọn 1 | chữ in đỏ trong file `.docx` |
+| `mc` | Trắc nghiệm A/B/C/D, chọn 1 | chữ đỏ, highlight hoặc gạch chân ký hiệu/nội dung đáp án trong `.docx` |
 | `tf` | 4 ý đúng/sai (a, b, c, d) | đọc từ bảng `Đúng/Sai` ngay sau câu |
 | `sa` | Trả lời ngắn (số/chuỗi) | dòng `Đáp án: ...` ngay sau câu |
 
 Chấm điểm tự động — `sa` so sánh không phân biệt hoa/thường và bỏ qua khoảng trắng.
+
+### Đánh dấu đáp án trắc nghiệm trong Word
+
+- Mỗi câu bắt đầu bằng `Câu N.`, có đủ bốn phương án `A.`, `B.`, `C.`, `D.` (hoặc `A)`, `B)`, `C)`, `D)`).
+- Chỉ đánh dấu **một** phương án đúng: đổi màu chữ sang đỏ (kể cả đỏ đậm), dùng Text Highlight Color hoặc gạch chân. Có thể đánh dấu riêng chữ A/B/C/D hoặc phần nội dung đáp án.
+- Hỗ trợ phương án trên cùng dòng, mỗi phương án một đoạn, hoặc bảng phương án A/B/C/D trong Word (đọc theo từng hàng). Định dạng từ character/paragraph style và màu theme cũng được xét.
+- Nếu không có hoặc có nhiều phương án được đánh dấu, đáp án để trống kèm cảnh báo; giáo viên cần kiểm tra lại trong trang sửa đề. Tránh dùng các định dạng đánh dấu đáp án chỉ để trang trí phương án khác.
+- Bản sửa áp dụng khi **tải DOCX mới**. Đề đã nhập trước đó cần sửa đáp án trong trang quản trị hoặc tải lại file để tạo đề mới.
+
+Kiểm thử bộ đọc DOCX và API tải đề (SQLite tạm, không chạm dữ liệu đang chạy):
+
+```bash
+uv run --frozen python -m unittest discover -s tests -v
+```

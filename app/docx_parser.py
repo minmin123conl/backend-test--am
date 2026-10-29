@@ -2,8 +2,8 @@
 
 The parser detects:
   - Multiple-choice questions ("Câu N: ... A. ... B. ... C. ... D. ...")
-    with the correct answer marked by RED text color (FF0000) on the option
-    letter or option content.
+    with the correct answer marked by red text, highlight, or underline on
+    the option letter or option content (including options in Word tables).
   - True/False questions (Phần II) with 4 sub-statements a/b/c/d. The
     correct answers are read from a small table that follows each TF
     question (rows like "a) Đúng", "b) Sai", ...).
@@ -32,6 +32,7 @@ The output schema matches what the rest of the backend expects:
 from __future__ import annotations
 
 import base64
+import colorsys
 import hashlib
 import json
 import os
@@ -40,6 +41,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from docx import Document
 from docx.oxml.ns import qn
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from lxml import etree
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -47,19 +50,124 @@ PIC_NS = "http://schemas.openxmlformats.org/drawingml/2006/picture"
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 M_NS = "http://schemas.openxmlformats.org/officeDocument/2006/math"
 
-R_OPEN = "[[R]]"
-R_CLOSE = "[[/R]]"
+# Internal markers are removed before storing/displaying question content.
+MARK_OPEN = "[[R]]"
+MARK_CLOSE = "[[/R]]"
 
 
 def _qn(ns: str, tag: str) -> str:
     return f"{{{ns}}}{tag}"
 
 
-def _is_red(rpr) -> bool:
-    if rpr is None:
+def _is_red_color(value: str) -> bool:
+    """Recognise red and dark-red shades, but not orange, purple, or black."""
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", value):
         return False
-    cl = rpr.find(qn("w:color"))
-    return cl is not None and (cl.get(qn("w:val")) or "").upper() == "FF0000"
+    r, g, b = (int(value[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    hue, saturation, brightness = colorsys.rgb_to_hsv(r, g, b)
+    return (hue <= 1 / 24 or hue >= 23 / 24) and saturation >= 0.3 and brightness >= 0.4
+
+
+class _AnswerFormatting:
+    """Resolve run formatting, including Word styles and theme colours.
+
+    An explicit value such as black, highlight=none or underline=none must
+    override an inherited marking. Cache style chains once per document.
+    """
+
+    def __init__(self, doc_part):
+        styles = doc_part.styles.element
+        self.styles = {s.get(qn("w:styleId")): s for s in styles.findall(qn("w:style"))}
+        self.default_paragraph_style = next(
+            (s.get(qn("w:styleId")) for s in self.styles.values()
+             if s.get(qn("w:type")) == "paragraph" and s.get(qn("w:default")) == "1"),
+            None,
+        )
+        self.defaults = styles.find("w:docDefaults/w:rPrDefault/w:rPr", namespaces=styles.nsmap)
+        self.style_cache: Dict[str, list] = {}
+        self.theme_colors: Dict[str, str] = {}
+        for rel in doc_part.rels.values():
+            if rel.reltype == RT.THEME:
+                theme = etree.fromstring(rel.target_part.blob)
+                scheme = theme.find(f".//{{{A_NS}}}clrScheme")
+                if scheme is not None:
+                    for color in scheme:
+                        if len(color):
+                            self.theme_colors[etree.QName(color).localname] = (
+                                color[0].get("lastClr") or color[0].get("val") or ""
+                            )
+                break
+
+    def _style_properties(self, style_id):
+        if style_id not in self.style_cache:
+            properties = []
+            seen = set()
+            current = style_id
+            while current in self.styles and current not in seen:
+                seen.add(current)
+                style = self.styles[current]
+                rpr = style.find(qn("w:rPr"))
+                if rpr is not None:
+                    properties.append(rpr)
+                based_on = style.find(qn("w:basedOn"))
+                current = based_on.get(qn("w:val")) if based_on is not None else None
+            self.style_cache[style_id] = properties
+        return self.style_cache[style_id]
+
+    def _color(self, element, value_attr="val", theme_attr="themeColor") -> str:
+        value = element.get(qn(f"w:{value_attr}"), "")
+        theme_name = element.get(qn(f"w:{theme_attr}"))
+        aliases = {"dark1": "dk1", "dark2": "dk2", "light1": "lt1", "light2": "lt2"}
+        themed = self.theme_colors.get(aliases.get(theme_name, theme_name))
+        if themed and re.fullmatch(r"[0-9a-fA-F]{6}", themed):
+            channels = [int(themed[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+            hue, lightness, saturation = colorsys.rgb_to_hls(*channels)
+            # Word applies theme tint/shade to HSL luminance. For a tint,
+            # FF leaves the colour unchanged and 00 makes it white.
+            attrs = ("themeFillShade", "themeFillTint") if theme_attr == "themeFill" else ("themeShade", "themeTint")
+            for attr in attrs:
+                amount = element.get(qn(f"w:{attr}"))
+                if amount and re.fullmatch(r"[0-9a-fA-F]{2}", amount):
+                    factor = int(amount, 16) / 255
+                    lightness = (lightness * factor if attr.endswith("Shade")
+                                 else lightness * factor + (1 - factor))
+            channels = colorsys.hls_to_rgb(hue, lightness, saturation)
+            value = "".join(f"{round(c * 255):02X}" for c in channels)
+        return value
+
+    def is_marked(self, run, paragraph) -> bool:
+        properties = []
+        rpr = run.find(qn("w:rPr"))
+        if rpr is not None:
+            properties.append(rpr)
+            run_style = rpr.find(qn("w:rStyle"))
+            if run_style is not None:
+                properties.extend(self._style_properties(run_style.get(qn("w:val"))))
+        ppr = paragraph.find(qn("w:pPr"))
+        pstyle = ppr.find(qn("w:pStyle")) if ppr is not None else None
+        style_id = pstyle.get(qn("w:val")) if pstyle is not None else self.default_paragraph_style
+        properties.extend(self._style_properties(style_id))
+        if self.defaults is not None:
+            properties.append(self.defaults)
+
+        def effective(name):
+            for prop in properties:
+                value = prop.find(qn(f"w:{name}"))
+                if value is not None:
+                    return value
+            return None
+
+        color = effective("color")
+        highlight = effective("highlight")
+        underline = effective("u")
+        shading = effective("shd")
+        return (
+            (color is not None and _is_red_color(self._color(color)))
+            or (highlight is not None and highlight.get(qn("w:val"), "none") not in ("none", "auto", "default", ""))
+            or (underline is not None and underline.get(qn("w:val"), "single") not in ("none", "0", "false", "off"))
+            or (shading is not None and shading.get(qn("w:val")) != "nil"
+                and _is_red_color(self._color(shading, "fill", "themeFill")))
+        )
 
 
 def _omath_text(omath) -> str:
@@ -92,26 +200,35 @@ def _save_image(part, image_dir: str, url_prefix: str) -> Optional[str]:
     return f"{url_prefix.rstrip('/')}/{filename}"
 
 
-def _walk_paragraph(p, doc_part, image_dir: str, url_prefix: str) -> Tuple[str, List[str]]:
-    """Walk paragraph elements in document order; return (text_with_red_markers, images)."""
+def _walk_paragraph(p, doc_part, image_dir: str, url_prefix: str,
+                    formatting: _AnswerFormatting) -> Tuple[str, List[str]]:
+    """Walk paragraph elements in document order, preserving answer markings."""
     out: List[str] = []
     images: List[str] = []
+
+    def append(text, marked=False):
+        out.append(MARK_OPEN + text + MARK_CLOSE if marked else text)
+
+    def append_math(node, marked=False):
+        text = _omath_text(node)
+        if text:
+            marked = marked or any(
+                formatting.is_marked(run, p)
+                for run in node.iter(_qn(M_NS, "r"))
+            )
+            append(f"[MATH:{text}]", marked)
 
     def visit(node):
         tag = node.tag
         if tag == _qn(W_NS, "r"):
-            rpr = node.find(qn("w:rPr"))
-            red = _is_red(rpr)
+            marked = formatting.is_marked(node, p)
             # Walk children in order
             for child in node:
                 ctag = child.tag
                 if ctag == _qn(W_NS, "t"):
                     text = child.text or ""
                     if text:
-                        if red:
-                            out.append(R_OPEN + text + R_CLOSE)
-                        else:
-                            out.append(text)
+                        append(text, marked)
                 elif ctag == _qn(W_NS, "tab"):
                     out.append("\t")
                 elif ctag == _qn(W_NS, "br"):
@@ -124,24 +241,18 @@ def _walk_paragraph(p, doc_part, image_dir: str, url_prefix: str) -> Tuple[str, 
                             url = _save_image(doc_part.related_parts[rid], image_dir, url_prefix)
                             if url:
                                 images.append(url)
-                                out.append(f"[IMG:{url}]")
+                                append(f"[IMG:{url}]", marked)
                                 break
                 elif ctag == _qn(M_NS, "oMath") or ctag == _qn(M_NS, "oMathPara"):
-                    text = _omath_text(child)
-                    if text:
-                        out.append(f"[MATH:{text}]")
+                    append_math(child, marked)
                 else:
                     # Drill into other run children that may contain math/drawings
                     for sub in child.iter():
                         if sub.tag == _qn(M_NS, "oMath"):
-                            text = _omath_text(sub)
-                            if text:
-                                out.append(f"[MATH:{text}]")
+                            append_math(sub, marked)
                             break
         elif tag == _qn(M_NS, "oMath") or tag == _qn(M_NS, "oMathPara"):
-            text = _omath_text(node)
-            if text:
-                out.append(f"[MATH:{text}]")
+            append_math(node)
         else:
             for child in node:
                 visit(child)
@@ -175,7 +286,7 @@ def _table_answers(tbl) -> Dict[str, bool]:
 
 def _is_tf_answer_table(rows: List[List[str]]) -> bool:
     """A TF answer table is a 1×4 (or 4×1) grid of '<letter>) Đúng|Sai' cells."""
-    flat = [_strip_red(c).strip() for r in rows for c in r if _strip_red(c).strip()]
+    flat = [_strip_answer_marks(c).strip() for r in rows for c in r if _strip_answer_marks(c).strip()]
     if len(flat) != 4:
         return False
     for c in flat:
@@ -184,8 +295,9 @@ def _is_tf_answer_table(rows: List[List[str]]) -> bool:
     return True
 
 
-def _table_to_rows(tbl, doc_part, image_dir: str, url_prefix: str) -> List[List[str]]:
-    """Extract table cells preserving inline markers (IMG/MATH).
+def _table_to_rows(tbl, doc_part, image_dir: str, url_prefix: str,
+                   formatting: _AnswerFormatting) -> List[List[str]]:
+    """Extract table cells preserving answer markings and inline IMG/MATH.
 
     Returns a list of rows, each row a list of cell text strings. Newlines
     inside a cell are preserved as '\n'.
@@ -196,8 +308,8 @@ def _table_to_rows(tbl, doc_part, image_dir: str, url_prefix: str) -> List[List[
         for tc in tr.findall(qn("w:tc")):
             paragraphs: List[str] = []
             for p in tc.findall(qn("w:p")):
-                txt, _imgs = _walk_paragraph(p, doc_part, image_dir, url_prefix)
-                txt = _strip_red(txt).strip()
+                txt, _imgs = _walk_paragraph(p, doc_part, image_dir, url_prefix, formatting)
+                txt = txt.strip()
                 if txt:
                     paragraphs.append(txt)
             row.append("\n".join(paragraphs))
@@ -208,19 +320,20 @@ def _table_to_rows(tbl, doc_part, image_dir: str, url_prefix: str) -> List[List[
 
 def _table_marker(rows: List[List[str]]) -> str:
     """Encode rows as a base64-wrapped TABLE marker, safe for inline storage."""
-    payload = json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    clean_rows = [[_strip_answer_marks(cell) for cell in row] for row in rows]
+    payload = json.dumps(clean_rows, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     b64 = base64.b64encode(payload).decode("ascii")
     return f"[TABLE:{b64}]"
 
 
-def _strip_red(s: str) -> str:
-    return s.replace(R_OPEN, "").replace(R_CLOSE, "")
+def _strip_answer_marks(s: str) -> str:
+    return s.replace(MARK_OPEN, "").replace(MARK_CLOSE, "")
 
 
 def _starts_with_cau(p: str) -> bool:
     """Return True if paragraph starts with a question marker (Câu N), tolerating
     leading markers like [IMG:...] or [MATH:...] from inline content."""
-    s = _strip_red(p).strip()
+    s = _strip_answer_marks(p).strip()
     s = re.sub(r"^(?:\[(?:IMG|MATH):[^\]]*\]\s*)+", "", s)
     return bool(re.match(r"^\s*C[âa]u\s*\d+\b", s))
 
@@ -239,22 +352,19 @@ def _strip_cau_prefix(text: str) -> str:
     return (leading + rest).strip()
 
 
-def _red_spans(s: str) -> Tuple[str, List[Tuple[int, int]]]:
-    """Return (clean_text, list_of_red_spans_in_clean_text)."""
+def _answer_spans(s: str) -> Tuple[str, List[Tuple[int, int]]]:
+    """Return clean text and marked character ranges in that text."""
     out: List[str] = []
     spans: List[Tuple[int, int]] = []
     i = 0
-    red_start = 0
-    in_red = False
+    mark_start = 0
     while i < len(s):
-        if s[i:i + len(R_OPEN)] == R_OPEN:
-            in_red = True
-            red_start = sum(len(x) for x in out)
-            i += len(R_OPEN)
-        elif s[i:i + len(R_CLOSE)] == R_CLOSE:
-            in_red = False
-            spans.append((red_start, sum(len(x) for x in out)))
-            i += len(R_CLOSE)
+        if s[i:i + len(MARK_OPEN)] == MARK_OPEN:
+            mark_start = len(out)
+            i += len(MARK_OPEN)
+        elif s[i:i + len(MARK_CLOSE)] == MARK_CLOSE:
+            spans.append((mark_start, len(out)))
+            i += len(MARK_CLOSE)
         else:
             out.append(s[i])
             i += 1
@@ -262,7 +372,7 @@ def _red_spans(s: str) -> Tuple[str, List[Tuple[int, int]]]:
 
 
 def _parse_mc(block_text: str) -> Optional[Dict[str, Any]]:
-    clean, spans = _red_spans(block_text)
+    clean, spans = _answer_spans(block_text)
     matches: List[Tuple[int, str, int]] = []
     # Allow option markers to follow whitespace, newline, or any non-alphanumeric
     # character (e.g. '?A.' or ']A.' from inline images).
@@ -292,20 +402,29 @@ def _parse_mc(block_text: str) -> Optional[Dict[str, Any]]:
     for i, (pos, letter, end) in enumerate(picked):
         opt_end = picked[i + 1][0] if i + 1 < len(picked) else len(clean)
         options[letter] = clean[end:opt_end].strip()
-    red_coverage = {letter: 0 for letter in expected}
+    marked_options = []
     for i, (pos, letter, end) in enumerate(picked):
         opt_end = picked[i + 1][0] if i + 1 < len(picked) else len(clean)
-        for s, e in spans:
-            ov_start = max(s, pos)
-            ov_end = min(e, opt_end)
-            if ov_end > ov_start:
-                red_coverage[letter] += ov_end - ov_start
-    answer_letter, max_cov = max(red_coverage.items(), key=lambda x: x[1])
+        if any(clean[max(s, pos):min(e, opt_end)].strip()
+               for s, e in spans if min(e, opt_end) > max(s, pos)):
+            marked_options.append(letter)
     return {
         "question": question_text,
         "options": options,
-        "answer": answer_letter if max_cov > 0 else None,
+        "answer": marked_options[0] if len(marked_options) == 1 else None,
+        "_marked_options": marked_options,
     }
+
+
+def _mc_option_table_text(rows: List[List[str]]) -> Optional[str]:
+    """Flatten an A/B/C/D option grid; leave ordinary content tables intact."""
+    cells = [cell for row in rows for cell in row if _strip_answer_marks(cell).strip()]
+    if not cells or not all(
+        re.match(r"^[A-D]\s*[.)]", _strip_answer_marks(cell).strip()) for cell in cells
+    ):
+        return None
+    text = "\n".join(cells)
+    return text if _parse_mc(text) is not None else None
 
 
 def _parse_short_answer(block_text: str) -> Optional[Dict[str, Any]]:
@@ -313,7 +432,7 @@ def _parse_short_answer(block_text: str) -> Optional[Dict[str, Any]]:
     "Câu N. <body...> Đáp án: <answer>"
     Returns {"question": str, "answer": str}.
     """
-    clean = _strip_red(block_text).strip()
+    clean = _strip_answer_marks(block_text).strip()
     if not clean:
         return None
     m = re.search(r"Đ[áa]p\s*[áa]n\s*[:\-]\s*([^\n]+)", clean, re.IGNORECASE)
@@ -328,7 +447,7 @@ def _parse_short_answer(block_text: str) -> Optional[Dict[str, Any]]:
 
 
 def _parse_tf(block_text: str, tbl_answers: Dict[str, bool]) -> Optional[Dict[str, Any]]:
-    clean, _ = _red_spans(block_text)
+    clean, _ = _answer_spans(block_text)
     expected = ["a", "b", "c", "d"]
     # First pass: try strict a/b/c/d sequence
     picked: List[Tuple[int, str, int]] = []
@@ -367,12 +486,13 @@ def parse_docx(path: str, image_dir: str, url_prefix: str) -> Dict[str, Any]:
     """Main entry point — parse the docx file and return structured exam."""
     warnings: List[str] = []
     doc = Document(path)
+    formatting = _AnswerFormatting(doc.part)
     body = doc.element.body
     items: List[Tuple[str, Any, List[str]]] = []  # (kind, value, images)
     for child in body.iterchildren():
         tag = child.tag.split("}")[-1]
         if tag == "p":
-            txt, imgs = _walk_paragraph(child, doc.part, image_dir, url_prefix)
+            txt, imgs = _walk_paragraph(child, doc.part, image_dir, url_prefix, formatting)
             if txt.strip() or imgs:
                 items.append(("p", txt, imgs))
         elif tag == "tbl":
@@ -384,13 +504,14 @@ def parse_docx(path: str, image_dir: str, url_prefix: str) -> Dict[str, Any]:
                     url = _save_image(doc.part.related_parts[rid], image_dir, url_prefix)
                     if url:
                         table_imgs.append(url)
-            rows = _table_to_rows(child, doc.part, image_dir, url_prefix)
+            rows = _table_to_rows(child, doc.part, image_dir, url_prefix, formatting)
             answers = _table_answers(child)
             tbl_obj = {
                 "answers": answers,
                 "rows": rows,
                 "marker": _table_marker(rows),
                 "is_answer_table": _is_tf_answer_table(rows),
+                "mc_option_text": _mc_option_table_text(rows),
             }
             items.append(("tbl", tbl_obj, table_imgs))
 
@@ -404,7 +525,7 @@ def parse_docx(path: str, image_dir: str, url_prefix: str) -> Dict[str, Any]:
     for i, (t, v, _imgs) in enumerate(items):
         if t != "p" or not isinstance(v, str):
             continue
-        s = _strip_red(v)
+        s = _strip_answer_marks(v)
         sl = s.lower()
         if tf_start is None and tf_pat.search(sl) and "đúng sai" in sl:
             tf_start = i
@@ -426,10 +547,10 @@ def parse_docx(path: str, image_dir: str, url_prefix: str) -> Dict[str, Any]:
     current_section: Dict[str, Any] = {"title": "PHẦN I", "items": []}
     sec_pat = re.compile(r"^\s*ph[ầa]n\s+(?:[ivx]+|\d+)\b[.:]?", re.IGNORECASE)
     for t, v, imgs in mc_items:
-        if t == "p" and isinstance(v, str) and sec_pat.match(_strip_red(v).strip()):
+        if t == "p" and isinstance(v, str) and sec_pat.match(_strip_answer_marks(v).strip()):
             if current_section["items"]:
                 sections.append(current_section)
-            current_section = {"title": _strip_red(v).strip(), "items": []}
+            current_section = {"title": _strip_answer_marks(v).strip(), "items": []}
         else:
             current_section["items"].append((t, v, imgs))
     if current_section["items"]:
@@ -460,15 +581,25 @@ def parse_docx(path: str, image_dir: str, url_prefix: str) -> Dict[str, Any]:
                 if t == "p" and isinstance(v, str):
                     parts.append(v)
                 elif t == "tbl" and isinstance(v, dict) and not v.get("is_answer_table"):
-                    parts.append(v.get("marker", ""))
+                    parts.append(v.get("mc_option_text") or v.get("marker", ""))
             if not parts:
                 continue
             block = "\n".join(parts)
             parsed = _parse_mc(block)
             if parsed:
                 parsed["images"] = imgs
+                marked_options = parsed.pop("_marked_options")
                 if parsed.get("answer") is None:
-                    warnings.append(f"Không tìm thấy đáp án (đỏ) cho: {parsed['question'][:60]}…")
+                    if marked_options:
+                        warnings.append(
+                            f"Nhiều phương án được đánh dấu ({', '.join(marked_options)}) "
+                            f"cho: {parsed['question'][:60]}… Vui lòng chọn lại một đáp án đúng."
+                        )
+                    else:
+                        warnings.append(
+                            "Không tìm thấy đáp án (chữ đỏ, highlight hoặc gạch chân) "
+                            f"cho: {parsed['question'][:60]}…"
+                        )
                 section_qs.append(parsed)
         if section_qs:
             out_sections.append({"title": section["title"], "questions": section_qs})
